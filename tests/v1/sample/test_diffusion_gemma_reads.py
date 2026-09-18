@@ -115,6 +115,8 @@ def _denoise_once(
     slots: list[int],
     compute_sc: bool = True,
     width: int = CL,
+    clamp_seeds: bool = False,
+    embed_weight: torch.Tensor | None = None,
 ) -> None:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -136,11 +138,14 @@ def _denoise_once(
         states.is_encoder_phase,
         states.confident,
         states.self_conditioning_embeds[:, :width],
-        torch.zeros(VOCAB, 4, device=device),
+        torch.zeros(VOCAB, 4, device=device) if embed_weight is None else embed_weight,
         torch.tensor(1.0, device=device),
         states.accepted_canvas_history[:, :, :width],
         states.accepted_canvas_history_len,
         states.max_steps,
+        states.seed_canvas[:, :width],
+        states.free_mask[:, :width],
+        states.has_seed,
         torch.zeros(n, CL, dtype=torch.int32, device=device)[:, :width],
         torch.zeros(n, dtype=torch.int32, device=device),
         torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device),
@@ -157,6 +162,7 @@ def _denoise_once(
         tp_size=1,
         tp_group_name="",
         compute_sc=compute_sc,
+        clamp_seeds=clamp_seeds,
     )
 
 
@@ -184,6 +190,76 @@ def test_narrow_tile_leaves_the_rest_of_the_canvas_alone():
     assert states.canvas[0, 4:].tolist() == [5] * (CL - 4)
     assert states.argmax_canvas[0, 4:].tolist() == [5] * (CL - 4)
     assert states.step[0] == 1
+
+
+def test_slot_positions_are_the_only_free_canvas_columns():
+    states = _states()
+    states.add_request(0)
+    states.set_slot_positions(0, [2, 5])
+
+    assert states.free_mask[0].tolist() == [i in (2, 5) for i in range(CL)]
+    assert states.clamped_slots == {0}
+
+    # The slot forgets its mask when it is reused.
+    states.add_request(0)
+    assert states.free_mask[0].all()
+    assert not states.clamped_slots
+
+
+def test_clamped_positions_hold_the_seed_across_steps():
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+    seed = [9] * CL
+    states.set_seed_canvas(0, seed)
+    states.set_slot_positions(0, [3])
+    states.canvas[0] = 9
+
+    for _ in range(4):
+        _denoise_once(states, [0], clamp_seeds=True)
+        canvas = states.canvas[0].tolist()
+        argmax = states.argmax_canvas[0].tolist()
+        fixed = [i for i in range(CL) if i != 3]
+        assert [canvas[i] for i in fixed] == [9] * len(fixed)
+        assert [argmax[i] for i in fixed] == [9] * len(fixed)
+
+    # Flat logits argmax to token 0, so the free slot is not the seed token.
+    assert states.argmax_canvas[0, 3] == 0
+
+
+def test_an_unmasked_seeded_slot_denoises_the_whole_canvas():
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+    states.set_seed_canvas(0, [9] * CL)
+    states.canvas[0] = 9
+
+    # Same tile, clamping on: with no slot positions the mask is all-free, so
+    # the step re-noises as it always did.
+    _denoise_once(states, [0], clamp_seeds=True)
+
+    assert states.argmax_canvas[0].tolist() == [0] * CL
+    assert (states.canvas[0] != 9).any()
+
+
+def test_self_conditioning_is_one_hot_at_clamped_positions():
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+    states.set_seed_canvas(0, [4] * CL)
+    states.set_slot_positions(0, [1])
+    # One distinguishable embedding row per token id.
+    embed_weight = torch.arange(VOCAB, dtype=torch.float32, device=states.device)
+    embed_weight = embed_weight[:, None].repeat(1, 4)
+
+    _denoise_once(states, [0], clamp_seeds=True, embed_weight=embed_weight)
+
+    sc = states.self_conditioning_embeds[0]
+    fixed = [i for i in range(CL) if i != 1]
+    # Held positions carry the seed token's embedding row exactly; the free
+    # one carries the model's own (uniform) mixture.
+    assert sc[fixed].eq(4.0).all()
+    assert not sc[1].eq(4.0).any()
 
 
 def test_step_cap_is_per_slot():

@@ -2,14 +2,22 @@
 
 A discrete diffusion model denoises a whole canvas per forward pass. If the
 canvas is seeded with the answer's fixed text and only the answer slots are
-left as noise, one denoise step yields a distribution over each slot. Three `extra_args` fields (`vllm_xargs` on the OpenAI server) expose
+left as noise, one denoise step yields a distribution over each slot. A few `extra_args` fields (`vllm_xargs` on the OpenAI server) expose
 that:
 
 | field | type | meaning |
 |---|---|---|
 | `diffusion_seed_canvas` | `list[int]`, exactly `canvas_length` ids | replaces the random initial canvas after prefill |
+| `diffusion_slot_positions` | `list[int]`, positions into the canvas | the positions the seed leaves free; every other one is written back to its seed token on every step |
 | `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
 | `diffusion_read_only` | `bool` | emit the argmax canvas as soon as the cap is reached, end the request there, and return temperature-1 logprobs at every position |
+
+The sampler re-noises every position it does not accept, and it noises with
+ordinary vocabulary tokens rather than a mask token, so a seeded template
+decays from the second step on. `diffusion_slot_positions` is what lets a
+read run more than one step over the template it was given: the held
+positions keep their seed token, count as accepted, and self-condition on
+that token instead of on the model's own guess.
 
 `structured_server.py` is the layer that turns a question schema into those
 fields. It speaks `/v1/chat/completions`: the system message is the schema,

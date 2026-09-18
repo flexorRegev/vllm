@@ -82,11 +82,59 @@ def _verify_diffusion(params: SamplingParams, canvas_length: int | None = None):
         ({"diffusion_max_steps": True}, "positive integer"),
         ({"diffusion_read_only": "yes"}, "boolean"),
         ({"diffusion_read_only": 2}, "boolean"),
+        (
+            {"diffusion_seed_canvas": [0] * 8, "diffusion_slot_positions": 3},
+            "list of canvas positions",
+        ),
+        (
+            {"diffusion_seed_canvas": [0] * 8, "diffusion_slot_positions": [1, 2.5]},
+            "list of canvas positions",
+        ),
+        (
+            {"diffusion_seed_canvas": [0] * 8, "diffusion_slot_positions": [1, True]},
+            "list of canvas positions",
+        ),
+        (
+            {"diffusion_seed_canvas": [0] * 8, "diffusion_slot_positions": [1, 1]},
+            "must not repeat",
+        ),
+        ({"diffusion_slot_positions": [1]}, "needs diffusion_seed_canvas"),
     ],
 )
 def test_diffusion_rejects_bad_extra_args(extra_args: dict, match: str):
     with pytest.raises(VLLMValidationError, match=match):
         _verify_diffusion(SamplingParams(extra_args=extra_args))
+
+
+def test_diffusion_slot_positions_must_land_on_the_canvas():
+    def params(positions: list[int], **extra):
+        return SamplingParams(
+            extra_args={
+                "diffusion_seed_canvas": [0] * 8,
+                "diffusion_slot_positions": positions,
+                **extra,
+            }
+        )
+
+    _verify_diffusion(params([0, 7]), canvas_length=8)
+    for bad in ([8], [-1]):
+        with pytest.raises(VLLMValidationError, match=r"in \[0, 8\)"):
+            _verify_diffusion(params(bad), canvas_length=8)
+    # The request's own canvas width bounds them, not the served one.
+    with pytest.raises(VLLMValidationError, match=r"in \[0, 4\)"):
+        _verify_diffusion(
+            SamplingParams(
+                extra_args={
+                    "diffusion_canvas_length": 4,
+                    "diffusion_seed_canvas": [0] * 4,
+                    "diffusion_slot_positions": [5],
+                }
+            ),
+            canvas_length=8,
+        )
+    # Without a served diffusion config the seed is the only width there is.
+    with pytest.raises(VLLMValidationError, match=r"in \[0, 8\)"):
+        _verify_diffusion(params([9]))
 
 
 def test_diffusion_seed_canvas_must_fill_the_canvas():

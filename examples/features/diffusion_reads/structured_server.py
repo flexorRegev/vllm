@@ -299,6 +299,7 @@ def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None
         "return_tokens_as_token_ids": True,
         "chat_template_kwargs": {"enable_thinking": False},
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
+                       "diffusion_slot_positions": [s["pos"] for s in slots],
                        "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
     }
     d = upstream_chat(body)
@@ -340,6 +341,7 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
         "logprob_token_ids": label_id_union(slots),
         "return_tokens_as_token_ids": True,
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
+                       "diffusion_slot_positions": [s["pos"] for s in slots],
                        "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
     }
     d = upstream_completions(body)

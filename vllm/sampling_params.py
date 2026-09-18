@@ -1087,7 +1087,8 @@ class SamplingParams(
 
         On the GPU a seed id outside the vocabulary is a device-side assert.
         ``diffusion_seed_canvas``: token ids, one per canvas position, that
-        replace the random canvas after prefill. ``diffusion_max_steps``:
+        replace the random canvas after prefill. ``diffusion_slot_positions``:
+        the canvas positions that seed leaves free. ``diffusion_max_steps``:
         denoise steps per canvas. ``diffusion_read_only``: end the request
         on the first canvas that converges.
         """
@@ -1130,6 +1131,36 @@ class SamplingParams(
                 raise VLLMValidationError(
                     "diffusion_seed_canvas must hold exactly "
                     f"{expected_len} ids, got {len(seed)}.",
+                    parameter="extra_args",
+                )
+
+        # Positions the seed leaves free. Every other position is held at its
+        # seed token on every denoise step, so a multi-step read keeps the
+        # template it was given.
+        slots = extra.get("diffusion_slot_positions")
+        if slots is not None:
+            if not isinstance(slots, (list, tuple)) or not all(
+                isinstance(p, int) and not isinstance(p, bool) for p in slots
+            ):
+                raise VLLMValidationError(
+                    "diffusion_slot_positions must be a list of canvas positions.",
+                    parameter="extra_args",
+                )
+            if len(set(slots)) != len(slots):
+                raise VLLMValidationError(
+                    "diffusion_slot_positions must not repeat a position.",
+                    parameter="extra_args",
+                )
+            if seed is None:
+                raise VLLMValidationError(
+                    "diffusion_slot_positions needs diffusion_seed_canvas: every "
+                    "position outside it is held at its seed token.",
+                    parameter="extra_args",
+                )
+            canvas = expected_len if expected_len is not None else len(seed)
+            if any(p < 0 or p >= canvas for p in slots):
+                raise VLLMValidationError(
+                    f"diffusion_slot_positions must be in [0, {canvas}).",
                     parameter="extra_args",
                 )
 
