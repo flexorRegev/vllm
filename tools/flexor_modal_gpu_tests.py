@@ -22,7 +22,13 @@ DEFAULT_TESTS = "tests/test_sampling_params.py tests/v1/sample/test_diffusion_ge
 image = (
     modal.Image.from_registry("vllm/vllm-openai:nightly", add_python=None)
     .entrypoint([])
-    .pip_install("pytest")
+    # The image ships python3 (system or /opt/venv) but no `python` on PATH, and
+    # its venv may have no pip; resolve both before installing pytest.
+    .run_commands(
+        "set -e; PY=$(command -v python3 || echo /opt/venv/bin/python3); echo using $PY; "
+        "ln -sf $PY /usr/local/bin/python; "
+        "($PY -m pip install pytest || uv pip install --python $PY pytest)"
+    )
     .add_local_dir(str(FORK_ROOT / "vllm"), remote_path="/fork/vllm", ignore=["**/__pycache__/**", "**/*.pyc"])
     .add_local_dir(str(FORK_ROOT / "tests"), remote_path="/fork/tests", ignore=["**/__pycache__/**", "**/*.pyc"])
 )
@@ -32,7 +38,6 @@ app = modal.App("flexor-vllm-fork-gpu-tests", image=image)
 
 @app.function(gpu="L4", timeout=30 * 60)
 def run_tests(pytest_args: str) -> int:
-    import glob
     import os
     import shutil
     import subprocess
@@ -40,13 +45,22 @@ def run_tests(pytest_args: str) -> int:
 
     import vllm as installed_vllm
 
+    # Fill in whatever the fork tree lacks from the installed package, without
+    # clobbering fork sources: compiled extensions (`_C`, `_vllm_fa2_C`, ...)
+    # in any subpackage, and build-generated files such as `_version.py`.
     installed_dir = os.path.dirname(installed_vllm.__file__)
-    for so in glob.glob(os.path.join(installed_dir, "*.so")):
-        shutil.copy(so, "/fork/vllm/")
-    for name in ("version.py", "_version.py"):
-        src = os.path.join(installed_dir, name)
-        if os.path.exists(src) and not os.path.exists(f"/fork/vllm/{name}"):
-            shutil.copy(src, "/fork/vllm/")
+    copied = 0
+    for root, _dirs, files in os.walk(installed_dir):
+        rel = os.path.relpath(root, installed_dir)
+        dest_dir = os.path.normpath(os.path.join("/fork/vllm", rel))
+        for name in files:
+            dest = os.path.join(dest_dir, name)
+            if os.path.exists(dest) or name.endswith(".pyc"):
+                continue
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copy(os.path.join(root, name), dest)
+            copied += 1
+    print(f"filled {copied} files from the installed package", flush=True)
 
     env = dict(os.environ, PYTHONPATH="/fork", VLLM_LOGGING_LEVEL="WARNING")
     cmd = [sys.executable, "-m", "pytest", *pytest_args.split(), "-q", "-p", "no:cacheprovider", "--noconftest", "-rs"]
