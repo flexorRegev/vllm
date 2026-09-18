@@ -653,6 +653,10 @@ class CompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    # Per-step slot scores of a DiffusionGemma read, when the request asked
+    # for them with the ``diffusion_trajectory`` extra arg. See
+    # examples/features/diffusion_reads.
+    diffusion_trajectory: dict[str, Any] | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):

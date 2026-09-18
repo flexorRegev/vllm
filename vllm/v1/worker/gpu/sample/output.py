@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -20,6 +20,9 @@ class SamplerOutput:
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    # req_id -> per-step slot scores of a diffusion read, on its emitting
+    # step. Already on the host: only a diffusion sampler sets it.
+    diffusion_trajectories: dict[str, dict[str, Any]] | None = None
 
 
 @triton.jit

@@ -11,6 +11,7 @@ that:
 | `diffusion_slot_positions` | `list[int]`, positions into the canvas | the positions the seed leaves free; every other one is written back to its seed token on every step |
 | `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
 | `diffusion_read_only` | `bool` | emit the argmax canvas as soon as the cap is reached, end the request there, and return temperature-1 logprobs at every position |
+| `diffusion_trajectory` | `bool`, read-only requests only | report the slot scores of every denoise step, not only the emitting one's |
 
 The sampler re-noises every position it does not accept, and it noises with
 ordinary vocabulary tokens rather than a mask token, so a seeded template
@@ -18,6 +19,28 @@ decays from the second step on. `diffusion_slot_positions` is what lets a
 read run more than one step over the template it was given: the held
 positions keep their seed token, count as accepted, and self-condition on
 that token instead of on the model's own guess.
+
+A read normally reports only the canvas it emits. `diffusion_trajectory`
+returns the whole run under `diffusion_trajectory` on the choice, from the
+temperature-1 logits of each step:
+
+```json
+{"positions": [7, 11],
+ "label_token_ids": [3919, 4088],
+ "steps": [{"step": 1,
+            "argmax_id": [3919, 4088],
+            "argmax_logprob": [-0.03, -1.21],
+            "entropy": [0.18, 1.44],
+            "label_logprobs": [[-0.03, -3.55], [-1.90, -1.21]]}]}
+```
+
+`positions` is `diffusion_slot_positions`, or every canvas position when the
+request did not name any; `label_token_ids` is the request's
+`logprob_token_ids` and `label_logprobs` follows that order. It is one entry
+per denoise step, so flip count, stabilization step and trajectory entropy
+come out of a single read. The schema field `"trajectory": true` in
+`structured_server.py` turns it on and returns it under
+`diagnostics.trajectory`, one entry per noise draw.
 
 `structured_server.py` is the layer that turns a question schema into those
 fields. It speaks `/v1/chat/completions`: the system message is the schema,

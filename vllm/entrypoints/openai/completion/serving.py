@@ -590,6 +590,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     routed_experts=routed_experts_b64,
+                    diffusion_trajectory=output.diffusion_trajectory,
                 )
                 choices.append(choice_data)
 

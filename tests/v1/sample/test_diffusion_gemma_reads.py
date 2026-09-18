@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-request DiffusionGemma state behind structured reads: seed canvases,
-read-only slots and the per-slot step cap."""
+read-only slots, the per-slot step cap and the per-step read trajectory."""
+
+import math
 
 import numpy as np
 import pytest
@@ -9,6 +11,7 @@ import torch
 
 from vllm.model_executor.models.diffusion_gemma import (
     DiffusionGemmaRequestStates,
+    DiffusionSampler,
     _compiled_sample_step,
 )
 from vllm.platforms import current_platform
@@ -274,3 +277,77 @@ def test_step_cap_is_per_slot():
     # Slot 0 hit its cap and moves to commit. Slot 1 keeps denoising.
     assert states.is_encoder_phase[:2].tolist() == [True, False]
     assert states.step[:2].tolist() == [1, 1]
+
+
+def _trajectory_sampler(states: DiffusionGemmaRequestStates) -> DiffusionSampler:
+    """Just enough sampler to drive the trajectory stash: recording reads the
+    diffusion states and writes the stash, nothing else."""
+    sampler = DiffusionSampler.__new__(DiffusionSampler)
+    sampler.diffusion_states = states
+    sampler._trajectory = {}
+    return sampler
+
+
+def _peaked_logits(states: DiffusionGemmaRequestStates) -> torch.Tensor:
+    """One canvas of flat logits, with position 1 peaked on token 6."""
+    logits = torch.zeros(CL, VOCAB, device=states.device)
+    logits[1, 6] = 10.0
+    return logits
+
+
+def test_trajectory_records_one_row_per_step():
+    states = _states()
+    states.add_request(0)
+    states.set_trajectory(0, [1, 3], [5, 6, 7])
+    sampler = _trajectory_sampler(states)
+    logits = _peaked_logits(states)
+
+    for _ in range(3):
+        sampler._record_trajectory(logits, [0], CL)
+    out = sampler._take_trajectory(0)
+
+    assert out["positions"] == [1, 3]
+    assert out["label_token_ids"] == [5, 6, 7]
+    assert [step["step"] for step in out["steps"]] == [1, 2, 3]
+    for step in out["steps"]:
+        assert step["argmax_id"] == [6, 0]
+        assert [len(row) for row in step["label_logprobs"]] == [3, 3]
+        # label_logprobs follow the request's id order: position 1 puts its
+        # mass on 6, the second of the three labels.
+        assert step["label_logprobs"][0][1] == pytest.approx(
+            step["argmax_logprob"][0], abs=1e-5
+        )
+        # Position 3 saw flat logits, so it carries the full-vocab entropy.
+        assert step["entropy"][1] == pytest.approx(math.log(VOCAB), abs=1e-4)
+        assert step["entropy"][0] < step["entropy"][1]
+    # The read has emitted; the slot keeps nothing.
+    assert not sampler._trajectory
+
+
+def test_trajectory_records_only_the_slots_that_asked():
+    states = _states()
+    for slot in (0, 1):
+        states.add_request(slot)
+    states.set_trajectory(1, [0], [])
+    sampler = _trajectory_sampler(states)
+
+    sampler._record_trajectory(
+        torch.zeros(2 * CL, VOCAB, device=states.device), [0, 1], CL
+    )
+
+    assert set(sampler._trajectory) == {1}
+    steps = sampler._take_trajectory(1)["steps"]
+    assert len(steps) == 1
+    assert steps[0]["label_logprobs"] == [[]]
+
+
+def test_trajectory_resets_with_the_slot():
+    states = _states()
+    states.add_request(0)
+    states.set_trajectory(0, [0, 1], [3])
+    assert states.trajectory_slots == {0}
+
+    states.add_request(0)
+
+    assert not states.trajectory_slots
+    assert not states.trajectory_meta

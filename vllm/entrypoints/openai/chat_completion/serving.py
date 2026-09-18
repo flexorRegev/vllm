@@ -1095,6 +1095,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None
                 ),
                 routed_experts=routed_experts_b64,
+                diffusion_trajectory=output.diffusion_trajectory,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

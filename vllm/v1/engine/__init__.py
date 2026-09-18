@@ -234,6 +234,10 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # The per-step slot scores of a diffusion read, on the output that emits
+    # its canvas. Appended last for the same reason.
+    diffusion_trajectory: dict[str, Any] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

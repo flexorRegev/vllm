@@ -1090,7 +1090,8 @@ class SamplingParams(
         replace the random canvas after prefill. ``diffusion_slot_positions``:
         the canvas positions that seed leaves free. ``diffusion_max_steps``:
         denoise steps per canvas. ``diffusion_read_only``: end the request
-        on the first canvas that converges.
+        on the first canvas that converges. ``diffusion_trajectory``: report
+        the slot scores of every denoise step, not just the emitting one's.
         """
         extra = self.extra_args
         if not extra:
@@ -1174,6 +1175,15 @@ class SamplingParams(
             )
 
         # The OpenAI server's vllm_xargs narrows JSON booleans to 0/1.
+        trajectory = extra.get("diffusion_trajectory")
+        if trajectory is not None and (
+            not isinstance(trajectory, (bool, int)) or trajectory not in (0, 1)
+        ):
+            raise VLLMValidationError(
+                "diffusion_trajectory must be a boolean (or 0/1).",
+                parameter="extra_args",
+            )
+
         read_only = extra.get("diffusion_read_only")
         if read_only is not None and (
             not isinstance(read_only, (bool, int)) or read_only not in (0, 1)
@@ -1189,6 +1199,13 @@ class SamplingParams(
             if expected_len is not None:
                 self.max_tokens = min(self.max_tokens or expected_len, expected_len)
             self.ignore_eos = True
+        elif trajectory:
+            # The trajectory is the read's own steps; a request that denoises
+            # on to a commit has no slot scores to report.
+            raise VLLMValidationError(
+                "diffusion_trajectory needs diffusion_read_only.",
+                parameter="extra_args",
+            )
 
     def _validate_structured_outputs(
         self,

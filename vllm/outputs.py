@@ -67,6 +67,9 @@ class CompletionOutput:
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+    # Per-step slot scores of a DiffusionGemma read (``diffusion_trajectory``
+    # in extra_args), populated on finish.
+    diffusion_trajectory: dict[str, Any] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

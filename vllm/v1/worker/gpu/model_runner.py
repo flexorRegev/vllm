@@ -2082,6 +2082,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             cudagraph_stats=cudagraph_stats,
+            diffusion_trajectories=sampler_output.diffusion_trajectories,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

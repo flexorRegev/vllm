@@ -99,6 +99,9 @@ def _verify_diffusion(params: SamplingParams, canvas_length: int | None = None):
             "must not repeat",
         ),
         ({"diffusion_slot_positions": [1]}, "needs diffusion_seed_canvas"),
+        ({"diffusion_trajectory": "yes"}, "boolean"),
+        ({"diffusion_trajectory": 2}, "boolean"),
+        ({"diffusion_trajectory": True}, "needs diffusion_read_only"),
     ],
 )
 def test_diffusion_rejects_bad_extra_args(extra_args: dict, match: str):
@@ -190,8 +193,10 @@ def test_diffusion_accepts_extra_args():
     params = SamplingParams(
         extra_args={
             "diffusion_seed_canvas": list(range(8)),
-            "diffusion_max_steps": 1,
+            "diffusion_slot_positions": [2, 4],
+            "diffusion_max_steps": 4,
             "diffusion_read_only": True,
+            "diffusion_trajectory": 1,
         }
     )
     _verify_diffusion(params, canvas_length=8)

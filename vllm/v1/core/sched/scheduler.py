@@ -1889,6 +1889,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        diffusion_trajectories = model_runner_output.diffusion_trajectories
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
@@ -2190,6 +2191,11 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        diffusion_trajectory=(
+                            diffusion_trajectories.get(req_id)
+                            if diffusion_trajectories
+                            else None
+                        ),
                     )
                 )
             else:

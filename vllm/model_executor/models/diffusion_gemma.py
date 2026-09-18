@@ -798,6 +798,13 @@ class DiffusionGemmaRequestStates:
         # forward.
         self.read_only = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         self.read_only_slots: set[int] = set()
+        # Read-only slots that also report every step's slot scores. The
+        # positions and label ids stay host-side for the response and on
+        # device for the per-step gather.
+        self.trajectory_slots: set[int] = set()
+        self.trajectory_meta: dict[int, tuple[list[int], list[int]]] = {}
+        self.trajectory_positions: dict[int, torch.Tensor] = {}
+        self.trajectory_labels: dict[int, torch.Tensor] = {}
         # Slots capped at one denoise step never consume a soft embed.
         self.single_step_slots: set[int] = set()
         # Per-slot canvas width, at most canvas_length. The scheduler schedules
@@ -840,6 +847,7 @@ class DiffusionGemmaRequestStates:
         self.clamped_slots.discard(slot_idx)
         self.read_only[slot_idx].fill_(False)
         self.read_only_slots.discard(slot_idx)
+        self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
         self.canvas_width_np[slot_idx] = self.canvas_length
 
@@ -852,6 +860,7 @@ class DiffusionGemmaRequestStates:
         self.seeded_slots.discard(slot_idx)
         self.clamped_slots.discard(slot_idx)
         self.read_only_slots.discard(slot_idx)
+        self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
 
     def set_seed_canvas(self, slot_idx: int, ids: list[int]) -> None:
@@ -873,6 +882,26 @@ class DiffusionGemmaRequestStates:
     def set_read_only(self, slot_idx: int) -> None:
         self.read_only[slot_idx].fill_(True)
         self.read_only_slots.add(slot_idx)
+
+    def set_trajectory(
+        self, slot_idx: int, positions: list[int], label_ids: list[int]
+    ) -> None:
+        """Report ``positions`` at every denoise step, with exact logprobs for
+        ``label_ids`` there."""
+        self.trajectory_slots.add(slot_idx)
+        self.trajectory_meta[slot_idx] = (positions, label_ids)
+        self.trajectory_positions[slot_idx] = async_tensor_h2d(
+            positions, dtype=torch.int64, device=self.device
+        )
+        self.trajectory_labels[slot_idx] = async_tensor_h2d(
+            label_ids, dtype=torch.int64, device=self.device
+        )
+
+    def forget_trajectory(self, slot_idx: int) -> None:
+        self.trajectory_slots.discard(slot_idx)
+        self.trajectory_meta.pop(slot_idx, None)
+        self.trajectory_positions.pop(slot_idx, None)
+        self.trajectory_labels.pop(slot_idx, None)
 
     def apply_seed_canvases(
         self, slots_np: np.ndarray, slots_gpu: torch.Tensor
@@ -1245,6 +1274,9 @@ class DiffusionSampler:
         # Populated after the post-sample kernel detects convergence; consumed
         # on the subsequent commit step when num_sampled=CANVAS_LEN.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
+        # Per-slot stash of one [num_positions, 3 + num_labels] row per denoise
+        # step, kept on device until the read emits.
+        self._trajectory: dict[int, list[torch.Tensor]] = {}
 
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
@@ -1255,6 +1287,7 @@ class DiffusionSampler:
         # Purge any stale logprobs stashed under this slot by a prior request
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
+        self._trajectory.pop(req_idx, None)
         self.sampling_states.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         extra = getattr(sampling_params, "extra_args", None) or {}
@@ -1283,6 +1316,13 @@ class DiffusionSampler:
             states.set_slot_positions(req_idx, list(positions))
         if extra.get("diffusion_read_only"):
             states.set_read_only(req_idx)
+        if extra.get("diffusion_trajectory"):
+            # Without named slots the whole canvas is the read.
+            states.set_trajectory(
+                req_idx,
+                list(positions) if positions is not None else list(range(width)),
+                list(getattr(sampling_params, "logprob_token_ids", None) or []),
+            )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -1353,6 +1393,57 @@ class DiffusionSampler:
     # Decode helpers
     # ------------------------------------------------------------------
 
+    def _record_trajectory(
+        self, tile_logits: torch.Tensor, tile_slots: list[int], W: int
+    ) -> None:
+        """Stash this denoise step's slot scores for every trajectory slot in
+        the tile. ``tile_logits`` is the model's own output, so the scores are
+        at temperature 1 like the read's. One small device tensor per step:
+        nothing crosses to the host until the read emits."""
+        states = self.diffusion_states
+        rows = tile_logits.float().view(len(tile_slots), W, -1)
+        for local_idx, slot in enumerate(tile_slots):
+            if slot not in states.trajectory_slots:
+                continue
+            positions = states.trajectory_positions[slot]
+            labels = states.trajectory_labels[slot]
+            logprobs = rows[local_idx].index_select(0, positions).log_softmax(dim=-1)
+            entropy = -(logprobs.exp() * logprobs).sum(dim=-1)
+            argmax_logprob, argmax_id = logprobs.max(dim=-1)
+            self._trajectory.setdefault(slot, []).append(
+                torch.cat(
+                    [
+                        argmax_id.to(logprobs.dtype).unsqueeze(1),
+                        argmax_logprob.unsqueeze(1),
+                        entropy.unsqueeze(1),
+                        logprobs.index_select(1, labels),
+                    ],
+                    dim=1,
+                )
+            )
+
+    def _take_trajectory(self, slot: int) -> dict[str, Any]:
+        """Hand the stashed steps to the host in one copy, as the response
+        structure. The read has emitted, so the slot keeps nothing."""
+        states = self.diffusion_states
+        positions, label_ids = states.trajectory_meta[slot]
+        steps = self._trajectory.pop(slot, [])
+        rows = torch.stack(steps).cpu().tolist() if steps else []
+        return {
+            "positions": positions,
+            "label_token_ids": label_ids,
+            "steps": [
+                {
+                    "step": i + 1,
+                    "argmax_id": [int(row[0]) for row in step],
+                    "argmax_logprob": [row[1] for row in step],
+                    "entropy": [row[2] for row in step],
+                    "label_logprobs": [row[3:] for row in step],
+                }
+                for i, step in enumerate(rows)
+            ],
+        }
+
     def _build_output(
         self,
         input_batch: Any,
@@ -1361,6 +1452,7 @@ class DiffusionSampler:
         per_req_nlogits_np: np.ndarray,
         device: torch.device,
         logprobs_tensors: LogprobsTensors | None = None,
+        diffusion_trajectories: dict[str, dict[str, Any]] | None = None,
     ) -> SamplerOutput:
         """Compute num_rejected and build SamplerOutput."""
         num_reqs = input_batch.num_reqs
@@ -1384,6 +1476,7 @@ class DiffusionSampler:
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            diffusion_trajectories=diffusion_trajectories,
         )
 
     # ------------------------------------------------------------------
@@ -1566,6 +1659,11 @@ class DiffusionSampler:
                     clamp_seeds=clamp_seeds,
                 )
 
+                if states.trajectory_slots and not states.trajectory_slots.isdisjoint(
+                    tile_slots_list
+                ):
+                    self._record_trajectory(tile_logits, tile_slots_list, W)
+
                 # Logprobs for denoise steps that just converged (is_encoder_phase
                 # flipped False→True), stashed per tile so `scaled` is freed each tile.
                 if want_logprobs:
@@ -1611,6 +1709,7 @@ class DiffusionSampler:
         # Read-only slots that converged this step emit their argmax canvas
         # now, skip the encoder phase, and hand out their logprobs below.
         emit_now: set[int] = set()
+        diffusion_trajectories: dict[str, dict[str, Any]] | None = None
         if states.read_only_slots and not states.read_only_slots.isdisjoint(
             decode_slots_np.tolist()
         ):
@@ -1626,6 +1725,14 @@ class DiffusionSampler:
                 num_sampled[ro_idx] = valid_canvas_len[ro_mask].to(num_sampled.dtype)
                 states.is_encoder_phase[ro_slots] = False
                 emit_now = set(ro_slots.tolist())
+                for slot in sorted(emit_now & states.trajectory_slots):
+                    req_id = input_batch.req_ids[
+                        int(np.flatnonzero(slots_np == slot)[0])
+                    ]
+                    if diffusion_trajectories is None:
+                        diffusion_trajectories = {}
+                    diffusion_trajectories[req_id] = self._take_trajectory(slot)
+                    states.forget_trajectory(slot)
 
         # Commit steps: is_committing was True at entry. Reassemble previously
         # stashed logprobs and attach to SamplerOutput.
@@ -1665,4 +1772,5 @@ class DiffusionSampler:
             per_req_nlogits_np,
             device,
             logprobs_tensors=logprobs_tensors,
+            diffusion_trajectories=diffusion_trajectories,
         )

@@ -183,6 +183,9 @@ class RequestState:
         # Per-sequence spec-decode accumulator; arrives once (on finish) via
         # EngineCoreOutput, then attached to this sequence's CompletionOutput.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+        # Per-step slot scores of a diffusion read; arrives once, on the
+        # output that emits the canvas.
+        self.diffusion_trajectory: dict[str, Any] | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -455,6 +458,7 @@ class RequestState:
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
             spec_decode_metrics=self.spec_decode_metrics if finished else None,
+            diffusion_trajectory=self.diffusion_trajectory if finished else None,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -703,6 +707,9 @@ class OutputProcessor:
 
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
+
+            if engine_core_output.diffusion_trajectory is not None:
+                req_state.diffusion_trajectory = engine_core_output.diffusion_trajectory
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None

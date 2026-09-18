@@ -112,12 +112,14 @@ def parse_schema(value):
     if chunk_prompt not in ("shared", "own"):
         raise SchemaError("schema: chunk_prompt must be \"shared\" or \"own\"")
     sequential = bool(value.get("sequential", False))
+    trajectory = bool(value.get("trajectory", False))
     think = value.get("think", 0)
     if isinstance(think, bool) or not isinstance(think, int) or not 0 <= think <= 4096:
         raise SchemaError("schema: think must be a thought budget in tokens, 0 to 4096")
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
             "steps": max(1, min(int(value.get("steps", 1)), 8)), "think": think,
             "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential,
+            "trajectory": trajectory,
             "format": "lines" if len(qs) <= 10 else "indexed"}
 
 
@@ -300,7 +302,8 @@ def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None
         "chat_template_kwargs": {"enable_thinking": False},
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
                        "diffusion_slot_positions": [s["pos"] for s in slots],
-                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
+                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True,
+                       **({"diffusion_trajectory": True} if schema["trajectory"] else {})},
     }
     d = upstream_chat(body)
     content = d["choices"][0]["logprobs"]["content"]
@@ -308,7 +311,7 @@ def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None
     for q, s in zip(schema["questions"], slots):
         top = {int(t["token"].split(":")[1]): t["logprob"] for t in content[s["pos"]]["top_logprobs"]}
         out.append(slot_distribution(top, s["label_ids"]))
-    return out, d.get("usage", {})
+    return out, d.get("usage", {}), d["choices"][0].get("diffusion_trajectory")
 
 
 def slot_distribution(top, label_ids):
@@ -342,7 +345,8 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
         "return_tokens_as_token_ids": True,
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
                        "diffusion_slot_positions": [s["pos"] for s in slots],
-                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
+                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True,
+                       **({"diffusion_trajectory": True} if schema["trajectory"] else {})},
     }
     d = upstream_completions(body)
     rows = d["choices"][0]["logprobs"]["top_logprobs"]
@@ -350,16 +354,20 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
     for q, sl in zip(schema["questions"], slots):
         top = {int(k.split(":")[1]): v for k, v in rows[sl["pos"]].items()}
         out.append(slot_distribution(top, sl["label_ids"]))
-    return out, d.get("usage", {})
+    return out, d.get("usage", {}), d["choices"][0].get("diffusion_trajectory")
 
 
 def read_many(schema, template, slots, sys_text, state_content, seed, n, prefix=None):
+    """The reads' label distributions, and their step trajectories when the
+    schema asked for them (None per read otherwise)."""
     results = [None] * n
+    trajectories = [None] * n
     errors = [None] * n
 
     def run(k):
         try:
-            results[k], _ = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919, prefix)
+            results[k], _, trajectories[k] = one_read(
+                schema, template, slots, sys_text, state_content, seed + k * 7919, prefix)
         except Exception as e:  # surfaced as one failed request below
             errors[k] = e
 
@@ -371,7 +379,7 @@ def read_many(schema, template, slots, sys_text, state_content, seed, n, prefix=
     for e in errors:
         if e is not None:
             raise e
-    return results
+    return results, trajectories
 
 
 def question_groups(schema):
@@ -457,6 +465,8 @@ def decide(schema, state_content, seed):
             "chunks": [[q["id"] for q in g] for g in groups],
             "chunk_prompt": "full" if schema["sequential"] else schema["chunk_prompt"],
             "sequential": schema["sequential"],
+            "trajectory": ([b["diagnostics"]["trajectory"] for b, _ in parts]
+                           if schema["trajectory"] else None),
             "thought": thought,
             "samples": {"n": [b["diagnostics"]["samples"]["n"] for b, _ in parts],
                         "tops": [b["diagnostics"]["samples"]["tops"] for b, _ in parts],
@@ -479,15 +489,18 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
     template, slots = template_for(schema, SCAFFOLD if prefix is None else [], lead)
     policy = schema["policy"]
     if policy["mode"] == "fixed":
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
+        reads, trajectories = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
         extended = None
         first_entropy = None
     else:
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, 1, prefix)
+        reads, trajectories = read_many(schema, template, slots, sys_text, state_content, seed, 1, prefix)
         first_entropy = {q["id"]: r["entropy"] for q, r in zip(schema["questions"], reads[0])}
         extended = max(first_entropy.values()) > policy["threshold"] and policy["max"] > 1
         if extended:
-            reads += read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1, prefix)
+            more, more_trajectories = read_many(
+                schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1, prefix)
+            reads += more
+            trajectories += more_trajectories
     elapsed_ms = (time.time() - started) * 1e3
 
     answers = {}
@@ -521,6 +534,7 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
             "steps": schema["steps"],
             "samples": {"n": n, "tops": tops, "policy": dict(policy, extended=extended, first_read_entropy=first_entropy)},
             "timing": {"total_ms": elapsed_ms, "reads": n},
+            "trajectory": trajectories if schema["trajectory"] else None,
             "thought": thought,
             "questions": diag_q,
             "engine": "vllm",
