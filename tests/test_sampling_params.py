@@ -102,6 +102,15 @@ def _verify_diffusion(params: SamplingParams, canvas_length: int | None = None):
         ({"diffusion_trajectory": "yes"}, "boolean"),
         ({"diffusion_trajectory": 2}, "boolean"),
         ({"diffusion_trajectory": True}, "needs diffusion_read_only"),
+        ({"diffusion_fixed_steps": "yes"}, "boolean"),
+        ({"diffusion_fixed_steps": 2}, "boolean"),
+        ({"diffusion_fixed_steps": True}, "needs diffusion_read_only"),
+        ({"diffusion_slots_never_accept": "yes"}, "boolean"),
+        ({"diffusion_slots_never_accept": 2}, "boolean"),
+        (
+            {"diffusion_slots_never_accept": True},
+            "needs diffusion_slot_positions",
+        ),
     ],
 )
 def test_diffusion_rejects_bad_extra_args(extra_args: dict, match: str):
@@ -196,6 +205,8 @@ def test_diffusion_accepts_extra_args():
             "diffusion_slot_positions": [2, 4],
             "diffusion_max_steps": 4,
             "diffusion_read_only": True,
+            "diffusion_fixed_steps": True,
+            "diffusion_slots_never_accept": 1,
             "diffusion_trajectory": 1,
         }
     )

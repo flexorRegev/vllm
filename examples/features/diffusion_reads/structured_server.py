@@ -113,13 +113,16 @@ def parse_schema(value):
         raise SchemaError("schema: chunk_prompt must be \"shared\" or \"own\"")
     sequential = bool(value.get("sequential", False))
     trajectory = bool(value.get("trajectory", False))
+    fixed_steps = bool(value.get("fixed_steps", False))
+    slots_never_accept = bool(value.get("slots_never_accept", False))
     think = value.get("think", 0)
     if isinstance(think, bool) or not isinstance(think, int) or not 0 <= think <= 4096:
         raise SchemaError("schema: think must be a thought budget in tokens, 0 to 4096")
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
             "steps": max(1, min(int(value.get("steps", 1)), 8)), "think": think,
             "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential,
-            "trajectory": trajectory,
+            "trajectory": trajectory, "fixed_steps": fixed_steps,
+            "slots_never_accept": slots_never_accept,
             "format": "lines" if len(qs) <= 10 else "indexed"}
 
 
@@ -303,7 +306,9 @@ def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
                        "diffusion_slot_positions": [s["pos"] for s in slots],
                        "diffusion_max_steps": schema["steps"], "diffusion_read_only": True,
-                       **({"diffusion_trajectory": True} if schema["trajectory"] else {})},
+                       **({"diffusion_trajectory": True} if schema["trajectory"] else {}),
+                       **({"diffusion_fixed_steps": True} if schema["fixed_steps"] else {}),
+                       **({"diffusion_slots_never_accept": True} if schema["slots_never_accept"] else {})},
     }
     d = upstream_chat(body)
     content = d["choices"][0]["logprobs"]["content"]
@@ -346,7 +351,9 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
                        "diffusion_slot_positions": [s["pos"] for s in slots],
                        "diffusion_max_steps": schema["steps"], "diffusion_read_only": True,
-                       **({"diffusion_trajectory": True} if schema["trajectory"] else {})},
+                       **({"diffusion_trajectory": True} if schema["trajectory"] else {}),
+                       **({"diffusion_fixed_steps": True} if schema["fixed_steps"] else {}),
+                       **({"diffusion_slots_never_accept": True} if schema["slots_never_accept"] else {})},
     }
     d = upstream_completions(body)
     rows = d["choices"][0]["logprobs"]["top_logprobs"]
@@ -532,6 +539,8 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
         "answers": answers,
         "diagnostics": {
             "steps": schema["steps"],
+            "fixed_steps": schema["fixed_steps"],
+            "slots_never_accept": schema["slots_never_accept"],
             "samples": {"n": n, "tops": tops, "policy": dict(policy, extended=extended, first_read_entropy=first_entropy)},
             "timing": {"total_ms": elapsed_ms, "reads": n},
             "trajectory": trajectories if schema["trajectory"] else None,

@@ -489,6 +489,8 @@ def _compiled_sample_step(
     seed_canvas: torch.Tensor,  # [max_num_reqs, CL]
     free_mask: torch.Tensor,  # [max_num_reqs, CL] bool, False → held at the seed
     has_seed: torch.Tensor,  # [max_num_reqs] bool
+    fixed_steps: torch.Tensor,  # [max_num_reqs] bool, only the cap ends the read
+    never_accept: torch.Tensor,  # [max_num_reqs] bool, free slots re-noised always
     # Output tensors (modified in-place)
     sampled: torch.Tensor,  # [num_reqs, CL]
     num_sampled: torch.Tensor,  # [num_reqs]
@@ -512,6 +514,7 @@ def _compiled_sample_step(
     tp_group_name: str,
     compute_sc: bool = True,
     clamp_seeds: bool = False,
+    never_accept_slots: bool = False,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
@@ -572,7 +575,17 @@ def _compiled_sample_step(
     # caller; those padded rows are uniform (max entropy, argmax 0), so they
     # never trigger early convergence and are stable, and only the real
     # ``valid_canvas_len`` tokens are committed (num_sampled below).
-    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
+    if clamp is None:
+        mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
+    else:
+        # Only the free slots can be uncertain, so average over those. Dividing
+        # the same entropy by the whole canvas would tie the threshold to how
+        # much template a request seeded: a wide enough template would declare
+        # any read confident.
+        free = (~clamp).to(token_entropy.dtype)
+        mean_entropy = (token_entropy * free).sum(dim=-1) / free.sum(dim=-1).clamp(
+            min=1.0
+        )
     confident_tensor[decode_slots] = mean_entropy < confidence_threshold
 
     # ---- Phase 4: Entropy-bound acceptance mask ----
@@ -586,6 +599,12 @@ def _compiled_sample_step(
         # Accepted, not re-noised: their zero entropy already sorts them
         # first, but say it rather than rely on the budget arithmetic.
         eb_mask = eb_mask | clamp
+        if never_accept_slots:
+            # The other half of the ablation: a flagged request's free slots
+            # are re-noised every step whatever their entropy, so the canvas
+            # never carries the slot's own guess forward and only
+            # self-conditioning does. The reported logits are unaffected.
+            eb_mask = eb_mask & (clamp | ~never_accept[decode_slots].unsqueeze(1))
 
     # ---- Phase 5: Post-sample ----
     is_commit = is_encoder_phase[decode_slots]  # [num_decode]
@@ -649,9 +668,12 @@ def _compiled_sample_step(
     stable = mismatch == 0
 
     step_after = step_tensor[decode_slots]
-    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
-        step_after >= max_steps_tensor[decode_slots]
-    )
+    # A fixed-step read runs its cap out: stability and confidence stop it
+    # early otherwise, and a calibration sweep needs exactly K steps.
+    adaptive = ~fixed_steps[decode_slots]
+    converged = (
+        adaptive & stable & confident_tensor[decode_slots] & (new_hist_len >= ST)
+    ) | (step_after >= max_steps_tensor[decode_slots])
     # Commit done → denoise next (False); denoise converged → commit next (True)
     is_encoder_phase[decode_slots] = torch.where(
         is_commit, is_commit.new_zeros(num_decode), converged
@@ -798,6 +820,11 @@ class DiffusionGemmaRequestStates:
         # forward.
         self.read_only = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         self.read_only_slots: set[int] = set()
+        # Reads that run their step cap out instead of stopping on stability
+        # and confidence, and reads whose free slots are never accepted.
+        self.fixed_steps = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
+        self.never_accept = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
+        self.never_accept_slots: set[int] = set()
         # Read-only slots that also report every step's slot scores. The
         # positions and label ids stay host-side for the response and on
         # device for the per-step gather.
@@ -847,6 +874,9 @@ class DiffusionGemmaRequestStates:
         self.clamped_slots.discard(slot_idx)
         self.read_only[slot_idx].fill_(False)
         self.read_only_slots.discard(slot_idx)
+        self.fixed_steps[slot_idx].fill_(False)
+        self.never_accept[slot_idx].fill_(False)
+        self.never_accept_slots.discard(slot_idx)
         self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
         self.canvas_width_np[slot_idx] = self.canvas_length
@@ -860,6 +890,7 @@ class DiffusionGemmaRequestStates:
         self.seeded_slots.discard(slot_idx)
         self.clamped_slots.discard(slot_idx)
         self.read_only_slots.discard(slot_idx)
+        self.never_accept_slots.discard(slot_idx)
         self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
 
@@ -882,6 +913,14 @@ class DiffusionGemmaRequestStates:
     def set_read_only(self, slot_idx: int) -> None:
         self.read_only[slot_idx].fill_(True)
         self.read_only_slots.add(slot_idx)
+
+    def set_fixed_steps(self, slot_idx: int) -> None:
+        self.fixed_steps[slot_idx].fill_(True)
+
+    def set_slots_never_accept(self, slot_idx: int) -> None:
+        """Re-noise the free slots every step, whatever the entropy bound says."""
+        self.never_accept[slot_idx].fill_(True)
+        self.never_accept_slots.add(slot_idx)
 
     def set_trajectory(
         self, slot_idx: int, positions: list[int], label_ids: list[int]
@@ -1316,6 +1355,14 @@ class DiffusionSampler:
             states.set_slot_positions(req_idx, list(positions))
         if extra.get("diffusion_read_only"):
             states.set_read_only(req_idx)
+        if extra.get("diffusion_fixed_steps"):
+            states.set_fixed_steps(req_idx)
+        if extra.get("diffusion_slots_never_accept"):
+            if positions is None:
+                raise ValueError(
+                    "diffusion_slots_never_accept needs diffusion_slot_positions"
+                )
+            states.set_slots_never_accept(req_idx)
         if extra.get("diffusion_trajectory"):
             # Without named slots the whole canvas is the read.
             states.set_trajectory(
@@ -1399,15 +1446,21 @@ class DiffusionSampler:
         """Stash this denoise step's slot scores for every trajectory slot in
         the tile. ``tile_logits`` is the model's own output, so the scores are
         at temperature 1 like the read's. One small device tensor per step:
-        nothing crosses to the host until the read emits."""
+        nothing crosses to the host until the read emits.
+
+        The slot rows are gathered before the fp32 cast: casting the tile
+        first would hold a second [tile * W, vocab] copy for the length of
+        the step, which at a wide canvas is gigabytes."""
         states = self.diffusion_states
-        rows = tile_logits.float().view(len(tile_slots), W, -1)
+        rows = tile_logits.view(len(tile_slots), W, -1)
         for local_idx, slot in enumerate(tile_slots):
             if slot not in states.trajectory_slots:
                 continue
             positions = states.trajectory_positions[slot]
             labels = states.trajectory_labels[slot]
-            logprobs = rows[local_idx].index_select(0, positions).log_softmax(dim=-1)
+            logprobs = (
+                rows[local_idx].index_select(0, positions).float().log_softmax(dim=-1)
+            )
             entropy = -(logprobs.exp() * logprobs).sum(dim=-1)
             argmax_logprob, argmax_id = logprobs.max(dim=-1)
             self._trajectory.setdefault(slot, []).append(
@@ -1616,6 +1669,9 @@ class DiffusionSampler:
                 clamp_seeds = bool(
                     states.clamped_slots
                 ) and not states.clamped_slots.isdisjoint(tile_slots_list)
+                never_accept_slots = bool(
+                    states.never_accept_slots
+                ) and not states.never_accept_slots.isdisjoint(tile_slots_list)
 
                 scaled = _compiled_sample_step(
                     tile_logits,
@@ -1638,6 +1694,8 @@ class DiffusionSampler:
                     states.seed_canvas[:, :W],
                     states.free_mask[:, :W],
                     states.has_seed,
+                    states.fixed_steps,
+                    states.never_accept,
                     # Output
                     sampled[:, :W],
                     num_sampled,
@@ -1657,6 +1715,7 @@ class DiffusionSampler:
                     tp_group_name=self.tp_group_name,
                     compute_sc=compute_sc,
                     clamp_seeds=clamp_seeds,
+                    never_accept_slots=never_accept_slots,
                 )
 
                 if states.trajectory_slots and not states.trajectory_slots.isdisjoint(

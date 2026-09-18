@@ -1090,8 +1090,11 @@ class SamplingParams(
         replace the random canvas after prefill. ``diffusion_slot_positions``:
         the canvas positions that seed leaves free. ``diffusion_max_steps``:
         denoise steps per canvas. ``diffusion_read_only``: end the request
-        on the first canvas that converges. ``diffusion_trajectory``: report
-        the slot scores of every denoise step, not just the emitting one's.
+        on the first canvas that converges. ``diffusion_fixed_steps``: run the
+        step cap out rather than stopping when the canvas settles.
+        ``diffusion_slots_never_accept``: re-noise the free slots every step.
+        ``diffusion_trajectory``: report the slot scores of every denoise
+        step, not just the emitting one's.
         """
         extra = self.extra_args
         if not extra:
@@ -1175,6 +1178,30 @@ class SamplingParams(
             )
 
         # The OpenAI server's vllm_xargs narrows JSON booleans to 0/1.
+        fixed_steps = extra.get("diffusion_fixed_steps")
+        if fixed_steps is not None and (
+            not isinstance(fixed_steps, (bool, int)) or fixed_steps not in (0, 1)
+        ):
+            raise VLLMValidationError(
+                "diffusion_fixed_steps must be a boolean (or 0/1).",
+                parameter="extra_args",
+            )
+
+        never_accept = extra.get("diffusion_slots_never_accept")
+        if never_accept is not None and (
+            not isinstance(never_accept, (bool, int)) or never_accept not in (0, 1)
+        ):
+            raise VLLMValidationError(
+                "diffusion_slots_never_accept must be a boolean (or 0/1).",
+                parameter="extra_args",
+            )
+        if never_accept and slots is None:
+            raise VLLMValidationError(
+                "diffusion_slots_never_accept needs diffusion_slot_positions: "
+                "it is the free slots that are never accepted.",
+                parameter="extra_args",
+            )
+
         trajectory = extra.get("diffusion_trajectory")
         if trajectory is not None and (
             not isinstance(trajectory, (bool, int)) or trajectory not in (0, 1)
@@ -1204,6 +1231,13 @@ class SamplingParams(
             # on to a commit has no slot scores to report.
             raise VLLMValidationError(
                 "diffusion_trajectory needs diffusion_read_only.",
+                parameter="extra_args",
+            )
+        elif fixed_steps:
+            # A generation's canvas has to converge before it commits, so
+            # holding it open to the cap would only spend steps.
+            raise VLLMValidationError(
+                "diffusion_fixed_steps needs diffusion_read_only.",
                 parameter="extra_args",
             )
 

@@ -119,7 +119,9 @@ def _denoise_once(
     compute_sc: bool = True,
     width: int = CL,
     clamp_seeds: bool = False,
+    never_accept_slots: bool = False,
     embed_weight: torch.Tensor | None = None,
+    logits: torch.Tensor | None = None,
 ) -> None:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -130,7 +132,7 @@ def _denoise_once(
     decode_slots = torch.tensor(slots, dtype=torch.int64, device=device)
     decode_idx = torch.arange(n, dtype=torch.int64, device=device)
     _compiled_sample_step(
-        torch.zeros(n * width, VOCAB, device=device),
+        torch.zeros(n * width, VOCAB, device=device) if logits is None else logits,
         decode_slots,
         decode_idx,
         decode_slots,
@@ -149,6 +151,8 @@ def _denoise_once(
         states.seed_canvas[:, :width],
         states.free_mask[:, :width],
         states.has_seed,
+        states.fixed_steps,
+        states.never_accept,
         torch.zeros(n, CL, dtype=torch.int32, device=device)[:, :width],
         torch.zeros(n, dtype=torch.int32, device=device),
         torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device),
@@ -166,6 +170,7 @@ def _denoise_once(
         tp_group_name="",
         compute_sc=compute_sc,
         clamp_seeds=clamp_seeds,
+        never_accept_slots=never_accept_slots,
     )
 
 
@@ -351,3 +356,146 @@ def test_trajectory_resets_with_the_slot():
 
     assert not states.trajectory_slots
     assert not states.trajectory_meta
+
+
+def _slot_logits(states: DiffusionGemmaRequestStates, peak: float, pos: int = 3):
+    """A canvas whose only uncertainty is at ``pos``: ``peak`` spread over two
+    tokens there, every other position certain on token 0."""
+    logits = torch.full((CL, VOCAB), -50.0, device=states.device)
+    logits[:, 0] = 50.0
+    logits[pos] = -50.0
+    logits[pos, 1] = peak
+    logits[pos, 2] = peak
+    return logits
+
+
+def test_confidence_is_read_over_the_free_slots_only():
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+    states.set_seed_canvas(0, [9] * CL)
+    states.set_slot_positions(0, [3])
+    # The free slot is split between two tokens: entropy log(2) = 0.69, well
+    # over the 0.1 threshold. Averaged over all eight positions it would be
+    # 0.087 and the read would call itself confident.
+    logits = _slot_logits(states, peak=0.0)
+
+    _denoise_once(states, [0], clamp_seeds=True, logits=logits)
+    assert not bool(states.confident[0])
+
+    # The same canvas without a mask: the held positions dilute the slot's
+    # entropy and the old criterion passes.
+    plain = _states()
+    plain.add_request(0)
+    plain.is_encoder_phase[0] = False
+    _denoise_once(plain, [0], logits=_slot_logits(plain, peak=0.0))
+    assert bool(plain.confident[0])
+
+
+def test_fixed_steps_runs_the_cap_out():
+    states = _states()
+    for slot in (0, 1):
+        states.add_request(slot)
+        states.is_encoder_phase[slot] = False
+        states.max_steps[slot] = 4
+    states.set_fixed_steps(1)
+    # Certain and stable everywhere: slot 0 converges as soon as the history
+    # is long enough, slot 1 keeps denoising to its cap.
+    logits = torch.full((2 * CL, VOCAB), -50.0, device=states.device)
+    logits[:, 0] = 50.0
+
+    for _ in range(2):
+        _denoise_once(states, [0, 1], logits=logits)
+    assert states.is_encoder_phase[:2].tolist() == [True, False]
+
+    # Slot 0 has left the denoise phase; run slot 1 out on its own.
+    for _ in range(2):
+        _denoise_once(states, [1], logits=logits[:CL])
+    assert states.step[1] == 4
+    assert bool(states.is_encoder_phase[1])
+
+
+def test_free_slots_are_never_accepted_when_the_request_says_so():
+    def run(never_accept: bool) -> list[int]:
+        states = _states()
+        states.add_request(0)
+        states.is_encoder_phase[0] = False
+        states.set_seed_canvas(0, [9] * CL)
+        states.set_slot_positions(0, [3])
+        if never_accept:
+            states.set_slots_never_accept(0)
+        # The slot is certain on token 1, so the entropy bound accepts it.
+        logits = torch.full((CL, VOCAB), -50.0, device=states.device)
+        logits[:, 0] = 50.0
+        logits[3] = -50.0
+        logits[3, 1] = 50.0
+        drawn = []
+        for _ in range(5):
+            # These logits converge the read, and the step after a converged
+            # one is the commit that re-inits the canvas. Hold the slot in the
+            # denoise phase: acceptance is what this test is about.
+            states.is_encoder_phase[0] = False
+            _denoise_once(
+                states,
+                [0],
+                clamp_seeds=True,
+                never_accept_slots=never_accept,
+                logits=logits,
+            )
+            drawn.append(int(states.canvas[0, 3]))
+            # The template is held either way.
+            assert states.canvas[0, 0] == 9
+            # And the model's own answer is still what the read reports.
+            assert states.argmax_canvas[0, 3] == 1
+        return drawn
+
+    assert run(never_accept=False) == [1] * 5
+    # Re-noised every step: five uniform draws over the vocabulary.
+    assert set(run(never_accept=True)) != {1}
+
+
+def test_trajectory_gathers_its_slots_before_the_fp32_cast():
+    """The tile's logits are [tile * W, vocab]; casting that to fp32 for a
+    handful of slot rows is gigabytes at a wide canvas."""
+
+    class _RecordCasts(torch.overrides.TorchFunctionMode):
+        def __init__(self):
+            self.shapes: list[tuple[int, ...]] = []
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.Tensor.float and args:
+                self.shapes.append(tuple(args[0].shape))
+            return func(*args, **kwargs)
+
+    states = _states()
+    for slot in (0, 1):
+        states.add_request(slot)
+    states.set_trajectory(1, [1, 3], [5, 6])
+    sampler = _trajectory_sampler(states)
+    tile = torch.zeros(2 * CL, VOCAB, device=states.device)
+
+    with _RecordCasts() as casts:
+        sampler._record_trajectory(tile, [0, 1], CL)
+
+    assert casts.shapes, "the slot rows are cast to fp32"
+    # Nothing wider than the slots the request asked for is ever upcast.
+    assert all(shape[0] <= 2 for shape in casts.shapes)
+    assert tuple(tile.shape) not in casts.shapes
+    rows = sampler._trajectory[1]
+    assert len(rows) == 1
+    assert tuple(rows[0].shape) == (2, 5)
+    assert rows[0].dtype is torch.float32
+
+
+def test_fixed_steps_and_never_accept_reset_with_the_slot():
+    states = _states()
+    states.add_request(0)
+    states.set_fixed_steps(0)
+    states.set_slots_never_accept(0)
+
+    states.add_request(0)
+
+    assert not bool(states.fixed_steps[0])
+    assert not bool(states.never_accept[0])
+    assert not states.never_accept_slots

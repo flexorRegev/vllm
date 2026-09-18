@@ -11,6 +11,8 @@ that:
 | `diffusion_slot_positions` | `list[int]`, positions into the canvas | the positions the seed leaves free; every other one is written back to its seed token on every step |
 | `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
 | `diffusion_read_only` | `bool` | emit the argmax canvas as soon as the cap is reached, end the request there, and return temperature-1 logprobs at every position |
+| `diffusion_fixed_steps` | `bool`, read-only requests only | run `diffusion_max_steps` steps whatever the canvas does, instead of stopping as soon as it settles |
+| `diffusion_slots_never_accept` | `bool`, needs `diffusion_slot_positions` | re-noise the free slots every step, so only self-conditioning carries the model's belief forward |
 | `diffusion_trajectory` | `bool`, read-only requests only | report the slot scores of every denoise step, not only the emitting one's |
 
 The sampler re-noises every position it does not accept, and it noises with
@@ -19,6 +21,11 @@ decays from the second step on. `diffusion_slot_positions` is what lets a
 read run more than one step over the template it was given: the held
 positions keep their seed token, count as accepted, and self-condition on
 that token instead of on the model's own guess.
+
+Confidence is read over the free slots alone, so the stopping rule does not
+get easier as the template gets wider. `diffusion_fixed_steps` removes that
+rule for a request and runs the step cap out, which is what a sweep over K
+steps needs; `diffusion_slots_never_accept` is its ablation partner.
 
 A read normally reports only the canvas it emits. `diffusion_trajectory`
 returns the whole run under `diffusion_trajectory` on the choice, from the
