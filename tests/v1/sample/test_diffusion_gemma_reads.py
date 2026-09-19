@@ -118,10 +118,10 @@ def _denoise_once(
     slots: list[int],
     compute_sc: bool = True,
     width: int = CL,
-    clamp_seeds: bool = False,
-    never_accept_slots: bool = False,
     embed_weight: torch.Tensor | None = None,
     logits: torch.Tensor | None = None,
+    normalizer: torch.Tensor | None = None,
+    eager: bool = False,
 ) -> None:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -131,7 +131,14 @@ def _denoise_once(
     device = states.device
     decode_slots = torch.tensor(slots, dtype=torch.int64, device=device)
     decode_idx = torch.arange(n, dtype=torch.int64, device=device)
-    _compiled_sample_step(
+    # Dynamo falls back to eager once a call site passes its recompile limit,
+    # so the un-compiled body has to be correct on its own.
+    step = (
+        _compiled_sample_step._torchdynamo_orig_callable
+        if eager
+        else _compiled_sample_step
+    )
+    step(
         torch.zeros(n * width, VOCAB, device=device) if logits is None else logits,
         decode_slots,
         decode_idx,
@@ -144,7 +151,7 @@ def _denoise_once(
         states.confident,
         states.self_conditioning_embeds[:, :width],
         torch.zeros(VOCAB, 4, device=device) if embed_weight is None else embed_weight,
-        torch.tensor(1.0, device=device),
+        torch.tensor(1.0, device=device) if normalizer is None else normalizer,
         states.accepted_canvas_history[:, :, :width],
         states.accepted_canvas_history_len,
         states.max_steps,
@@ -169,8 +176,6 @@ def _denoise_once(
         tp_size=1,
         tp_group_name="",
         compute_sc=compute_sc,
-        clamp_seeds=clamp_seeds,
-        never_accept_slots=never_accept_slots,
     )
 
 
@@ -206,12 +211,10 @@ def test_slot_positions_are_the_only_free_canvas_columns():
     states.set_slot_positions(0, [2, 5])
 
     assert states.free_mask[0].tolist() == [i in (2, 5) for i in range(CL)]
-    assert states.clamped_slots == {0}
 
     # The slot forgets its mask when it is reused.
     states.add_request(0)
     assert states.free_mask[0].all()
-    assert not states.clamped_slots
 
 
 def test_clamped_positions_hold_the_seed_across_steps():
@@ -224,7 +227,7 @@ def test_clamped_positions_hold_the_seed_across_steps():
     states.canvas[0] = 9
 
     for _ in range(4):
-        _denoise_once(states, [0], clamp_seeds=True)
+        _denoise_once(states, [0])
         canvas = states.canvas[0].tolist()
         argmax = states.argmax_canvas[0].tolist()
         fixed = [i for i in range(CL) if i != 3]
@@ -244,7 +247,7 @@ def test_an_unmasked_seeded_slot_denoises_the_whole_canvas():
 
     # Same tile, clamping on: with no slot positions the mask is all-free, so
     # the step re-noises as it always did.
-    _denoise_once(states, [0], clamp_seeds=True)
+    _denoise_once(states, [0])
 
     assert states.argmax_canvas[0].tolist() == [0] * CL
     assert (states.canvas[0] != 9).any()
@@ -260,7 +263,7 @@ def test_self_conditioning_is_one_hot_at_clamped_positions():
     embed_weight = torch.arange(VOCAB, dtype=torch.float32, device=states.device)
     embed_weight = embed_weight[:, None].repeat(1, 4)
 
-    _denoise_once(states, [0], clamp_seeds=True, embed_weight=embed_weight)
+    _denoise_once(states, [0], embed_weight=embed_weight)
 
     sc = states.self_conditioning_embeds[0]
     fixed = [i for i in range(CL) if i != 1]
@@ -380,7 +383,7 @@ def test_confidence_is_read_over_the_free_slots_only():
     # 0.087 and the read would call itself confident.
     logits = _slot_logits(states, peak=0.0)
 
-    _denoise_once(states, [0], clamp_seeds=True, logits=logits)
+    _denoise_once(states, [0], logits=logits)
     assert not bool(states.confident[0])
 
     # The same canvas without a mask: the held positions dilute the slot's
@@ -435,13 +438,7 @@ def test_free_slots_are_never_accepted_when_the_request_says_so():
             # one is the commit that re-inits the canvas. Hold the slot in the
             # denoise phase: acceptance is what this test is about.
             states.is_encoder_phase[0] = False
-            _denoise_once(
-                states,
-                [0],
-                clamp_seeds=True,
-                never_accept_slots=never_accept,
-                logits=logits,
-            )
+            _denoise_once(states, [0], logits=logits)
             drawn.append(int(states.canvas[0, 3]))
             # The template is held either way.
             assert states.canvas[0, 0] == 9
@@ -498,4 +495,50 @@ def test_fixed_steps_and_never_accept_reset_with_the_slot():
 
     assert not bool(states.fixed_steps[0])
     assert not bool(states.never_accept[0])
-    assert not states.never_accept_slots
+
+
+def test_three_seeded_multi_step_rows_share_one_tile():
+    """Concurrent structured reads land in one tile: every row is seeded,
+    clamped to its own free position and fixed to the step cap. Each row must
+    keep its own seed and its own step count."""
+    states = _states()
+    seeds = {0: [11] * CL, 1: [22] * CL, 2: [33] * CL}
+    free = {0: 1, 1: 3, 2: 5}
+    for slot, seed in seeds.items():
+        states.add_request(slot)
+        states.is_encoder_phase[slot] = False
+        states.set_seed_canvas(slot, seed)
+        states.set_slot_positions(slot, [free[slot]])
+        states.set_fixed_steps(slot)
+        states.max_steps[slot] = 3
+        states.canvas[slot] = seed[0]
+
+    for step in range(1, 4):
+        _denoise_once(states, [0, 1, 2])
+        for slot, seed in seeds.items():
+            canvas = states.canvas[slot].tolist()
+            held = [i for i in range(CL) if i != free[slot]]
+            assert [canvas[i] for i in held] == [seed[0]] * len(held)
+            assert states.step[slot] == step
+        # The cap is what ends a fixed-steps read, so no row commits early.
+        assert states.is_encoder_phase[:3].tolist() == [step == 3] * 3
+
+
+def test_self_conditioning_stores_into_the_fp32_buffer_from_bf16_embeddings():
+    """The soft embed follows the embedding dtype; the buffer is fp32. An index
+    put does not cast, so the eager body has to. Only the compiled graph hid
+    this, and dynamo runs the body eagerly once a call site recompiles enough."""
+    states = _states()
+    states.add_request(0)
+    states.is_encoder_phase[0] = False
+
+    _denoise_once(
+        states,
+        [0],
+        embed_weight=torch.ones(VOCAB, 4, device=states.device, dtype=torch.bfloat16),
+        normalizer=torch.tensor(1.0, device=states.device, dtype=torch.bfloat16),
+        eager=True,
+    )
+
+    assert states.self_conditioning_embeds.dtype == torch.float32
+    assert states.self_conditioning_embeds[0].ne(0).any()

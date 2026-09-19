@@ -513,8 +513,6 @@ def _compiled_sample_step(
     tp_size: int,
     tp_group_name: str,
     compute_sc: bool = True,
-    clamp_seeds: bool = False,
-    never_accept_slots: bool = False,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
@@ -526,13 +524,13 @@ def _compiled_sample_step(
 
     # Positions a seeded request did not leave free. The sampler re-noises
     # whatever it does not accept, so a template only survives past the first
-    # step if it is written back every step. ``None`` (no request in the tile
-    # named its slots) keeps the whole canvas free, which is plain denoising.
-    clamp: torch.Tensor | None = None
-    seed_tokens: torch.Tensor | None = None
-    if clamp_seeds:
-        clamp = has_seed[decode_slots].unsqueeze(1) & ~free_mask[decode_slots]
-        seed_tokens = seed_canvas[decode_slots]
+    # step if it is written back every step. An unseeded row, or a seeded one
+    # that named no positions, clamps nothing and denoises plainly: the mask
+    # is all-False and every branch below reduces to that path. The mask is a
+    # tensor rather than a per-tile flag so the compiled step keeps one graph
+    # whatever mix of requests a tile holds.
+    clamp = has_seed[decode_slots].unsqueeze(1) & ~free_mask[decode_slots]
+    seed_tokens = seed_canvas[decode_slots]
 
     # ---- Phase 1: Temperature schedule ----
     steps_f = step_tensor[decode_slots].float()
@@ -552,40 +550,32 @@ def _compiled_sample_step(
     argmax_tokens = (
         scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(num_decode, CL)
     )
-    if clamp is not None:
-        # Held positions read as their seed token everywhere downstream: the
-        # canvas the next step sees, the stability history, and the argmax
-        # canvas a read emits.
-        new_tokens = torch.where(clamp, seed_tokens, new_tokens)
-        argmax_tokens = torch.where(clamp, seed_tokens, argmax_tokens)
+    # Held positions read as their seed token everywhere downstream: the
+    # canvas the next step sees, the stability history, and the argmax canvas
+    # a read emits.
+    new_tokens = torch.where(clamp, seed_tokens, new_tokens)
+    argmax_tokens = torch.where(clamp, seed_tokens, argmax_tokens)
 
     # ---- Phase 3: Probs, self-conditioning, confidence ----
     log_probs = scaled.log_softmax(dim=-1)
     probs = log_probs.exp()
 
     token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
-    if clamp is not None:
-        # A held position is settled whatever the model thinks of it: it
-        # spends none of the acceptance budget below and cannot hold the
-        # canvas back from converging.
-        token_entropy = torch.where(
-            clamp, torch.zeros_like(token_entropy), token_entropy
-        )
+    # A held position is settled whatever the model thinks of it: it spends
+    # none of the acceptance budget below and cannot hold the canvas back
+    # from converging.
+    token_entropy = torch.where(clamp, torch.zeros_like(token_entropy), token_entropy)
     # A canvas truncated near max_model_len is zero-padded up to CL by the
     # caller; those padded rows are uniform (max entropy, argmax 0), so they
     # never trigger early convergence and are stable, and only the real
     # ``valid_canvas_len`` tokens are committed (num_sampled below).
-    if clamp is None:
-        mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
-    else:
-        # Only the free slots can be uncertain, so average over those. Dividing
-        # the same entropy by the whole canvas would tie the threshold to how
-        # much template a request seeded: a wide enough template would declare
-        # any read confident.
-        free = (~clamp).to(token_entropy.dtype)
-        mean_entropy = (token_entropy * free).sum(dim=-1) / free.sum(dim=-1).clamp(
-            min=1.0
-        )
+    # Only the free slots can be uncertain, so average over those. Dividing the
+    # same entropy by the whole canvas would tie the threshold to how much
+    # template a request seeded: a wide enough template would declare any read
+    # confident. With nothing clamped every position is free, which is the
+    # plain mean.
+    free = (~clamp).to(token_entropy.dtype)
+    mean_entropy = (token_entropy * free).sum(dim=-1) / free.sum(dim=-1).clamp(min=1.0)
     confident_tensor[decode_slots] = mean_entropy < confidence_threshold
 
     # ---- Phase 4: Entropy-bound acceptance mask ----
@@ -595,16 +585,14 @@ def _compiled_sample_step(
     sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
     eb_mask = torch.zeros_like(sorted_mask)
     eb_mask.scatter_(1, sorted_idx, sorted_mask)
-    if clamp is not None:
-        # Accepted, not re-noised: their zero entropy already sorts them
-        # first, but say it rather than rely on the budget arithmetic.
-        eb_mask = eb_mask | clamp
-        if never_accept_slots:
-            # The other half of the ablation: a flagged request's free slots
-            # are re-noised every step whatever their entropy, so the canvas
-            # never carries the slot's own guess forward and only
-            # self-conditioning does. The reported logits are unaffected.
-            eb_mask = eb_mask & (clamp | ~never_accept[decode_slots].unsqueeze(1))
+    # Accepted, not re-noised: their zero entropy already sorts them first,
+    # but say it rather than rely on the budget arithmetic.
+    eb_mask = eb_mask | clamp
+    # The other half of the ablation: a flagged request's free slots are
+    # re-noised every step whatever their entropy, so the canvas never carries
+    # the slot's own guess forward and only self-conditioning does. The
+    # reported logits are unaffected.
+    eb_mask = eb_mask & (clamp | ~never_accept[decode_slots].unsqueeze(1))
 
     # ---- Phase 5: Post-sample ----
     is_commit = is_encoder_phase[decode_slots]  # [num_decode]
@@ -696,25 +684,26 @@ def _compiled_sample_step(
         soft_embeds = torch.matmul(
             local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
         )
-        if clamp is not None:
-            # A held position self-conditions on what it is, not on what the
-            # model would have put there: the one-hot's soft embed is the seed
-            # token's embedding row. Only the rank that owns the id in its
-            # vocab shard contributes it; the others contribute zero, which is
-            # what the all-reduce below expects.
-            shard = sc_vocab_end - sc_vocab_start
-            local_ids = seed_tokens - sc_vocab_start
-            in_shard = (local_ids >= 0) & (local_ids < shard)
-            seed_embeds = embed_weight[local_ids.clamp(0, shard - 1)] * in_shard[
-                ..., None
-            ].to(embed_weight.dtype)
-            soft_embeds = torch.where(clamp[..., None], seed_embeds, soft_embeds)
+        # A held position self-conditions on what it is, not on what the model
+        # would have put there: the one-hot's soft embed is the seed token's
+        # embedding row. Only the rank that owns the id in its vocab shard
+        # contributes it; the others contribute zero, which is what the
+        # all-reduce below expects.
+        shard = sc_vocab_end - sc_vocab_start
+        local_ids = seed_tokens - sc_vocab_start
+        in_shard = (local_ids >= 0) & (local_ids < shard)
+        seed_embeds = embed_weight[local_ids.clamp(0, shard - 1)] * in_shard[
+            ..., None
+        ].to(embed_weight.dtype)
+        soft_embeds = torch.where(clamp[..., None], seed_embeds, soft_embeds)
         if tp_size > 1:
             soft_embeds = torch.ops.vllm.all_reduce(
                 soft_embeds, group_name=tp_group_name
             )
         soft_embeds = soft_embeds * normalizer
-        sc_embeds[decode_slots] = soft_embeds * sc_keep
+        # The soft embed follows the embedding dtype (bf16); the buffer is
+        # fp32, and an index put will not cast for us.
+        sc_embeds[decode_slots] = (soft_embeds * sc_keep).to(sc_embeds.dtype)
     else:
         # Every slot in this tile ends after this step, so the soft embed
         # would never be read. The matmul is a full pass over the vocabulary
@@ -815,7 +804,6 @@ class DiffusionGemmaRequestStates:
         self.free_mask = torch.ones(
             max_num_reqs, canvas_length, dtype=torch.bool, device=device
         )
-        self.clamped_slots: set[int] = set()
         # Read-only slots emit on their converging step and skip the commit
         # forward.
         self.read_only = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
@@ -824,7 +812,6 @@ class DiffusionGemmaRequestStates:
         # and confidence, and reads whose free slots are never accepted.
         self.fixed_steps = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         self.never_accept = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
-        self.never_accept_slots: set[int] = set()
         # Read-only slots that also report every step's slot scores. The
         # positions and label ids stay host-side for the response and on
         # device for the per-step gather.
@@ -871,12 +858,10 @@ class DiffusionGemmaRequestStates:
         self.has_seed[slot_idx].fill_(False)
         self.seeded_slots.discard(slot_idx)
         self.free_mask[slot_idx].fill_(True)
-        self.clamped_slots.discard(slot_idx)
         self.read_only[slot_idx].fill_(False)
         self.read_only_slots.discard(slot_idx)
         self.fixed_steps[slot_idx].fill_(False)
         self.never_accept[slot_idx].fill_(False)
-        self.never_accept_slots.discard(slot_idx)
         self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
         self.canvas_width_np[slot_idx] = self.canvas_length
@@ -888,9 +873,7 @@ class DiffusionGemmaRequestStates:
         self.accepted_canvas_history_len[slot_idx].fill_(0)
         self.self_conditioning_embeds[slot_idx] = 0
         self.seeded_slots.discard(slot_idx)
-        self.clamped_slots.discard(slot_idx)
         self.read_only_slots.discard(slot_idx)
-        self.never_accept_slots.discard(slot_idx)
         self.forget_trajectory(slot_idx)
         self.single_step_slots.discard(slot_idx)
 
@@ -908,7 +891,6 @@ class DiffusionGemmaRequestStates:
         self.free_mask[slot_idx].index_fill_(
             0, async_tensor_h2d(positions, dtype=torch.int64, device=self.device), True
         )
-        self.clamped_slots.add(slot_idx)
 
     def set_read_only(self, slot_idx: int) -> None:
         self.read_only[slot_idx].fill_(True)
@@ -920,7 +902,6 @@ class DiffusionGemmaRequestStates:
     def set_slots_never_accept(self, slot_idx: int) -> None:
         """Re-noise the free slots every step, whatever the entropy bound says."""
         self.never_accept[slot_idx].fill_(True)
-        self.never_accept_slots.add(slot_idx)
 
     def set_trajectory(
         self, slot_idx: int, positions: list[int], label_ids: list[int]
@@ -1666,13 +1647,6 @@ class DiffusionSampler:
                     not states.single_step_slots
                     or not states.single_step_slots.issuperset(tile_slots_list)
                 )
-                clamp_seeds = bool(
-                    states.clamped_slots
-                ) and not states.clamped_slots.isdisjoint(tile_slots_list)
-                never_accept_slots = bool(
-                    states.never_accept_slots
-                ) and not states.never_accept_slots.isdisjoint(tile_slots_list)
-
                 scaled = _compiled_sample_step(
                     tile_logits,
                     tile_slots,
@@ -1714,8 +1688,6 @@ class DiffusionSampler:
                     tp_size=self.tp_size,
                     tp_group_name=self.tp_group_name,
                     compute_sc=compute_sc,
-                    clamp_seeds=clamp_seeds,
-                    never_accept_slots=never_accept_slots,
                 )
 
                 if states.trajectory_slots and not states.trajectory_slots.isdisjoint(
